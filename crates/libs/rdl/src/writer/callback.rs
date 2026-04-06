@@ -1,13 +1,13 @@
 use super::*;
 
-pub fn write_callback(item: &metadata::reader::TypeDef) -> TokenStream {
+pub fn write_callback(item: &metadata::reader::TypeDef) -> Result<TokenStream, Error> {
     let namespace = item.namespace();
     let name = write_ident(item.name());
 
     let method = item
         .methods()
         .find(|method| method.name() == "Invoke")
-        .expect("callbacks are expected to have this named method");
+        .ok_or_else(|| writer_err!("callback `{}` has no `Invoke` method", item.name()))?;
 
     let signature = method.signature(&[]);
     let return_type = write_return_type(namespace, &method, &signature);
@@ -20,17 +20,20 @@ pub fn write_callback(item: &metadata::reader::TypeDef) -> TokenStream {
         &["UnmanagedFunctionPointerAttribute"],
     );
 
-    let abi = read_unmanaged_abi(item).and_then(|n| match n {
-        1 => None, // "system" is the default
-        2 => Some("C"),
-        5 => Some("fastcall"),
-        _ => {
-            unreachable!("unexpected CallingConvention value in UnmanagedFunctionPointerAttribute")
+    let abi = match read_unmanaged_abi(item) {
+        None => None,
+        Some(1) => None, // "system" is the default
+        Some(2) => Some("C"),
+        Some(5) => Some("fastcall"),
+        Some(n) => {
+            return Err(writer_err!(
+                "unexpected CallingConvention value {n} in `UnmanagedFunctionPointerAttribute`"
+            ))
         }
-    });
+    };
 
-    quote! {
+    Ok(quote! {
         #(#custom_attrs)*
         extern #abi fn #name (#(#params),*) #return_type;
-    }
+    })
 }

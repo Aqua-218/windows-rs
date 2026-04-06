@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn write_fn(namespace: &str, item: &metadata::reader::MethodDef) -> TokenStream {
+pub fn write_fn(namespace: &str, item: &metadata::reader::MethodDef) -> Result<TokenStream, Error> {
     let name = write_ident(item.name());
     let signature = item.signature(&[]);
 
@@ -15,7 +15,7 @@ pub fn write_fn(namespace: &str, item: &metadata::reader::MethodDef) -> TokenStr
     }
 
     let Some(impl_map) = item.impl_map() else {
-        unreachable!("fn item must have an ImplMap to be written as an `fn` item")
+        return Err(writer_err!("fn `{}` has no `ImplMap` record", item.name()));
     };
 
     let scope = impl_map.import_scope();
@@ -29,10 +29,10 @@ pub fn write_fn(namespace: &str, item: &metadata::reader::MethodDef) -> TokenStr
     } else if flags.contains(metadata::PInvokeAttributes::CallConvPlatformapi) {
         None
     } else {
-        unreachable!(
-            "unexpected calling convention in ImplMap flags: {:?}",
-            flags
-        )
+        return Err(writer_err!(
+            "unexpected calling convention in `ImplMap` flags for fn `{}`",
+            item.name()
+        ));
     };
 
     let custom_attrs = write_custom_attributes(item.attributes(), namespace, item.index());
@@ -43,9 +43,9 @@ pub fn write_fn(namespace: &str, item: &metadata::reader::MethodDef) -> TokenStr
         quote! { #[library(#library)] }
     };
 
-    quote! {
+    Ok(quote! {
         #(#custom_attrs)*
         #library_attr
         extern #abi fn #name(#(#params),*) #return_type;
-    }
+    })
 }

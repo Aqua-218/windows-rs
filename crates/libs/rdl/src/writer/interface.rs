@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn write_interface(item: &metadata::reader::TypeDef) -> TokenStream {
+pub fn write_interface(item: &metadata::reader::TypeDef) -> Result<TokenStream, Error> {
     let namespace = item.namespace();
     let name = write_ident(item.name());
 
@@ -21,12 +21,12 @@ pub fn write_interface(item: &metadata::reader::TypeDef) -> TokenStream {
         quote! { : #(#ifaces)+* }
     };
 
-    let guid_token = match interface_guid_output(item, &generics) {
+    let guid_token = match interface_guid_output(item, &generics)? {
         GuidOutput::None => quote! { #[no_guid] },
         GuidOutput::Omit => quote! {},
         GuidOutput::Explicit(d1, d2, d3, d4) => {
-            let hex: TokenStream = format_guid_u128(d1, d2, d3, d4).parse().unwrap();
-            quote! { #[guid(#hex)] }
+            let lit = syn::LitInt::new(&format_guid_u128(d1, d2, d3, d4), Span::call_site());
+            quote! { #[guid(#lit)] }
         }
     };
     let custom_attrs = write_custom_attributes_except(
@@ -36,13 +36,13 @@ pub fn write_interface(item: &metadata::reader::TypeDef) -> TokenStream {
         &["GuidAttribute"],
     );
 
-    quote! {
+    Ok(quote! {
         #guid_token
         #(#custom_attrs)*
         interface #name #generics_tokens #requires_tokens {
             #(#methods)*
         }
-    }
+    })
 }
 
 fn write_method(

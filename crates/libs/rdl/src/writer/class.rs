@@ -1,9 +1,11 @@
 use super::*;
 
-pub fn write_class(item: &metadata::reader::TypeDef) -> TokenStream {
+pub fn write_class(item: &metadata::reader::TypeDef) -> Result<TokenStream, Error> {
     let namespace = item.namespace();
     let name = write_ident(item.name());
-    let extends = item.extends().expect("class always extends");
+    let extends = item
+        .extends()
+        .ok_or_else(|| writer_err!("class `{}` has no base type", item.name()))?;
 
     let extends = if extends == ("System", "Object") {
         quote! {}
@@ -19,12 +21,12 @@ pub fn write_class(item: &metadata::reader::TypeDef) -> TokenStream {
 
     let interfaces = impls.iter().map(|imp| write_interface(namespace, imp));
 
-    quote! {
+    Ok(quote! {
         #(#custom_attrs)*
         class #name #extends {
             #(#interfaces)*
         }
-    }
+    })
 }
 
 fn write_interface(namespace: &str, imp: &metadata::reader::InterfaceImpl) -> TokenStream {
