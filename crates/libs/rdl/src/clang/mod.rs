@@ -28,6 +28,7 @@ use r#const::*;
 #[derive(Default)]
 pub struct Clang {
     input: Vec<String>,
+    input_str: Vec<String>,
     output: String,
     namespace: String,
     args: Vec<String>,
@@ -41,6 +42,11 @@ impl Clang {
 
     pub fn input(&mut self, input: &str) -> &mut Self {
         self.input.push(input.to_string());
+        self
+    }
+
+    pub fn input_str(&mut self, input: &str) -> &mut Self {
+        self.input_str.push(input.to_string());
         self
     }
 
@@ -91,72 +97,21 @@ impl Clang {
 
         for input in &h_paths {
             let tu = index.parse(input, &args)?;
-
-            for diag in tu.diagnostics() {
-                if diag.is_err() {
-                    return Err(Error::new(
-                        &diag.message,
-                        &diag.file_name,
-                        diag.line.try_into().unwrap(),
-                        (diag.column - 1).try_into().unwrap(),
-                    ));
-                }
+            let pending = self.process_tu(&tu, &mut collector)?;
+            for c in Const::evaluate_macros(input, &pending, &self.namespace, &index, &args)? {
+                collector.insert(Item::Const(c));
             }
+        }
 
-            // Macros that the token-based parser cannot handle (complex
-            // expressions, references to other macros, arithmetic, etc.) are
-            // collected here and evaluated in a second pass via the
-            // synthetic-enum technique.
-            let mut pending_macros: Vec<String> = vec![];
-
-            for child in tu.cursor().children() {
-                // Only process cursors from the main input file (not from
-                // transitively included headers).
-                if !child.is_from_main_file() {
-                    continue;
-                }
-
-                match child.kind() {
-                    CXCursor_StructDecl if child.is_definition() => {
-                        collector.insert(Item::Struct(Struct::parse(child, &self.namespace)?));
-                    }
-                    CXCursor_EnumDecl if child.is_definition() => {
-                        collector.insert(Item::Enum(Enum::parse(child)?));
-                    }
-                    CXCursor_TypedefDecl if child.is_definition() => {
-                        if let Some(cb) = Callback::parse(child, &self.namespace)? {
-                            collector.insert(Item::Callback(cb));
-                        } else if let Some(td) = Typedef::parse(child, &self.namespace)? {
-                            collector.insert(Item::Typedef(td));
-                        }
-                    }
-                    CXCursor_FunctionDecl if !child.is_definition() => {
-                        collector.insert(Item::Fn(Fn::parse(
-                            child,
-                            &self.namespace,
-                            &self.library,
-                        )?));
-                    }
-                    CXCursor_MacroDefinition => {
-                        if let Some(c) = Const::parse(child, &self.namespace, &tu)? {
-                            collector.insert(Item::Const(c));
-                        } else if !child.is_macro_builtin()
-                            && !child.is_macro_function_like()
-                            && !child.name().is_empty()
-                            && !child.name().starts_with('_')
-                        {
-                            // The token parser returned None for a candidate
-                            // object-like macro.  Defer to the batch evaluator.
-                            pending_macros.push(child.name());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Second pass: evaluate complex constant expressions using the
-            // synthetic-enum approach.  One bad macro does not abort the rest.
-            for c in Const::evaluate_macros(input, &pending_macros, &self.namespace, &index, &args)?
+        for content in &self.input_str {
+            let tu = index.parse_unsaved(
+                ".h",
+                content,
+                &args,
+                CXTranslationUnit_DetailedPreprocessingRecord,
+            )?;
+            let pending = self.process_tu(&tu, &mut collector)?;
+            for c in Const::evaluate_macros_str(content, &pending, &self.namespace, &index, &args)?
             {
                 collector.insert(Item::Const(c));
             }
@@ -181,5 +136,75 @@ impl Clang {
         write_to_file(&self.output, formatter::format(&output))?;
 
         Ok(())
+    }
+
+    /// Process a parsed translation unit: check for fatal diagnostics, walk
+    /// the cursor tree to populate `collector` with top-level items, and
+    /// return the names of any object-like macros whose bodies are too complex
+    /// for the token-based parser (to be evaluated in a second pass).
+    fn process_tu(
+        &self,
+        tu: &TranslationUnit,
+        collector: &mut Collector,
+    ) -> Result<Vec<String>, Error> {
+        for diag in tu.diagnostics() {
+            if diag.is_err() {
+                return Err(Error::new(
+                    &diag.message,
+                    &diag.file_name,
+                    diag.line.try_into().unwrap(),
+                    (diag.column - 1).try_into().unwrap(),
+                ));
+            }
+        }
+
+        // Macros that the token-based parser cannot handle (complex
+        // expressions, references to other macros, arithmetic, etc.) are
+        // collected here and evaluated in a second pass via the
+        // synthetic-enum technique.
+        let mut pending_macros: Vec<String> = vec![];
+
+        for child in tu.cursor().children() {
+            // Only process cursors from the main input file (not from
+            // transitively included headers).
+            if !child.is_from_main_file() {
+                continue;
+            }
+
+            match child.kind() {
+                CXCursor_StructDecl if child.is_definition() => {
+                    collector.insert(Item::Struct(Struct::parse(child, &self.namespace)?));
+                }
+                CXCursor_EnumDecl if child.is_definition() => {
+                    collector.insert(Item::Enum(Enum::parse(child)?));
+                }
+                CXCursor_TypedefDecl if child.is_definition() => {
+                    if let Some(cb) = Callback::parse(child, &self.namespace)? {
+                        collector.insert(Item::Callback(cb));
+                    } else if let Some(td) = Typedef::parse(child, &self.namespace)? {
+                        collector.insert(Item::Typedef(td));
+                    }
+                }
+                CXCursor_FunctionDecl if !child.is_definition() => {
+                    collector.insert(Item::Fn(Fn::parse(child, &self.namespace, &self.library)?));
+                }
+                CXCursor_MacroDefinition => {
+                    if let Some(c) = Const::parse(child, &self.namespace, tu)? {
+                        collector.insert(Item::Const(c));
+                    } else if !child.is_macro_builtin()
+                        && !child.is_macro_function_like()
+                        && !child.name().is_empty()
+                        && !child.name().starts_with('_')
+                    {
+                        // The token parser returned None for a candidate
+                        // object-like macro.  Defer to the batch evaluator.
+                        pending_macros.push(child.name());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(pending_macros)
     }
 }
