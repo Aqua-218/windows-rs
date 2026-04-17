@@ -52,12 +52,69 @@ impl Index {
                 cargs.len().try_into().unwrap(),
                 std::ptr::null_mut(),
                 0,
-                CXTranslationUnit_None,
+                CXTranslationUnit_DetailedPreprocessingRecord,
             )
         };
 
         if tu.is_null() {
             return Err(Error::new("failed to parse", input, 0, 0));
+        }
+
+        Ok(TranslationUnit(tu))
+    }
+
+    /// Parse a synthetic in-memory source file without requiring it to exist on
+    /// disk.
+    ///
+    /// The file's content is provided via the `content` string, which is
+    /// mapped to `filename` using a `CXUnsavedFile`.  This is the standard
+    /// libclang mechanism for injecting synthetic source; the file name is used
+    /// only as the virtual path from which relative `#include` directives
+    /// resolve.
+    ///
+    /// Parsing uses `CXTranslationUnit_KeepGoing` so that isolated errors
+    /// (e.g. from macros that are not valid integer constant expressions) do
+    /// not abort the entire translation unit.
+    pub fn parse_unsaved(
+        &self,
+        filename: &str,
+        content: &str,
+        args: &[&str],
+    ) -> Result<TranslationUnit, Error> {
+        let c_filename =
+            CString::new(filename).map_err(|_| Error::new("invalid filename", filename, 0, 0))?;
+        let c_content =
+            CString::new(content).map_err(|_| Error::new("invalid content", filename, 0, 0))?;
+
+        let mut cargs = vec![];
+        for arg in args {
+            cargs.push(
+                CString::new(*arg)
+                    .map_err(|_| Error::new(&format!("invalid argument: {arg}"), "", 0, 0))?,
+            );
+        }
+        let cargs: Vec<_> = cargs.iter().map(|a| a.as_ptr()).collect();
+
+        let mut unsaved = CXUnsavedFile {
+            Filename: c_filename.as_ptr(),
+            Contents: c_content.as_ptr(),
+            Length: content.len() as _,
+        };
+
+        let tu = unsafe {
+            clang_parseTranslationUnit(
+                self.0,
+                c_filename.as_ptr(),
+                cargs.as_ptr(),
+                cargs.len().try_into().unwrap(),
+                &mut unsaved,
+                1,
+                CXTranslationUnit_KeepGoing,
+            )
+        };
+
+        if tu.is_null() {
+            return Err(Error::new("failed to parse", filename, 0, 0));
         }
 
         Ok(TranslationUnit(tu))
@@ -122,6 +179,31 @@ impl TranslationUnit {
     pub fn cursor(&self) -> Cursor {
         Cursor(unsafe { clang_getTranslationUnitCursor(self.0) })
     }
+
+    /// Tokenize the given source range and return the spellings of all tokens.
+    pub fn tokenize(&self, range: CXSourceRange) -> Vec<(CXTokenKind, String)> {
+        unsafe {
+            let mut tokens: *mut CXToken = std::ptr::null_mut();
+            let mut n_tokens: u32 = 0;
+            clang_tokenize(self.0, range, &mut tokens, &mut n_tokens);
+
+            if n_tokens == 0 {
+                return vec![];
+            }
+
+            let result = (0..n_tokens as usize)
+                .map(|i| {
+                    let token = *tokens.add(i);
+                    let kind = clang_getTokenKind(token);
+                    let spelling = to_string(clang_getTokenSpelling(self.0, token));
+                    (kind, spelling)
+                })
+                .collect();
+
+            clang_disposeTokens(self.0, tokens, n_tokens);
+            result
+        }
+    }
 }
 
 impl Drop for TranslationUnit {
@@ -160,6 +242,25 @@ impl Cursor {
 
     pub fn is_definition(&self) -> bool {
         unsafe { clang_isCursorDefinition(self.0) != 0 }
+    }
+
+    pub fn is_from_main_file(&self) -> bool {
+        unsafe {
+            let loc = clang_getCursorLocation(self.0);
+            clang_Location_isFromMainFile(loc) != 0
+        }
+    }
+
+    pub fn is_macro_builtin(&self) -> bool {
+        unsafe { clang_Cursor_isMacroBuiltin(self.0) != 0 }
+    }
+
+    pub fn is_macro_function_like(&self) -> bool {
+        unsafe { clang_Cursor_isMacroFunctionLike(self.0) != 0 }
+    }
+
+    pub fn extent(&self) -> CXSourceRange {
+        unsafe { clang_getCursorExtent(self.0) }
     }
 
     pub fn enum_repr(&self) -> Type {
