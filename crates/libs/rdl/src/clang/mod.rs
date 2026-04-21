@@ -162,6 +162,11 @@ impl Clang {
             }
         }
 
+        // Build a map from struct/enum tag names to their preferred public typedef
+        // aliases.  This handles the C idiom `typedef struct _TAG {} TAG, *PTAG;`
+        // where `_TAG` is the internal tag and `TAG` is the intended public name.
+        let tag_rename = build_tag_rename_map(tu);
+
         // Macros that the token-based parser cannot handle (complex
         // expressions, references to other macros, arithmetic, etc.) are
         // collected here and evaluated in a second pass via the
@@ -196,6 +201,7 @@ impl Clang {
                         inner,
                         collector,
                         ref_map,
+                        &tag_rename,
                         tu,
                         &mut pending_macros,
                         &mut pending_typedefs,
@@ -207,6 +213,7 @@ impl Clang {
                     child,
                     collector,
                     ref_map,
+                    &tag_rename,
                     tu,
                     &mut pending_macros,
                     &mut pending_typedefs,
@@ -232,13 +239,21 @@ impl Clang {
             {
                 continue;
             }
-            if let Some(cb) =
-                Callback::parse(cursor, &self.namespace, ref_map, &mut pending_typedefs)?
-            {
+            if let Some(cb) = Callback::parse(
+                cursor,
+                &self.namespace,
+                ref_map,
+                &tag_rename,
+                &mut pending_typedefs,
+            )? {
                 collector.insert(Item::Callback(cb));
-            } else if let Some(td) =
-                Typedef::parse(cursor, &self.namespace, ref_map, &mut pending_typedefs)?
-            {
+            } else if let Some(td) = Typedef::parse(
+                cursor,
+                &self.namespace,
+                ref_map,
+                &tag_rename,
+                &mut pending_typedefs,
+            )? {
                 collector.insert(Item::Typedef(td));
             }
         }
@@ -250,11 +265,13 @@ impl Clang {
     /// `collector` or record the name in `pending_macros` for the second-pass
     /// evaluator.  `extern_c` is `true` when the cursor was found inside an
     /// `extern "C" { }` block (relevant only for function declarations).
+    #[allow(clippy::too_many_arguments)]
     fn process_cursor(
         &self,
         child: Cursor,
         collector: &mut Collector,
         ref_map: &HashMap<String, String>,
+        tag_rename: &HashMap<String, String>,
         tu: &TranslationUnit,
         pending_macros: &mut Vec<String>,
         pending_typedefs: &mut Vec<Cursor>,
@@ -262,7 +279,9 @@ impl Clang {
     ) -> Result<(), Error> {
         match child.kind() {
             CXCursor_StructDecl if child.is_definition() => {
-                let name = child.name();
+                let tag_name = child.name();
+                // Resolve the effective public name via the tag→typedef rename map.
+                let name = tag_rename.get(&tag_name).cloned().unwrap_or(tag_name);
                 if child.has_pure_virtual_methods() {
                     if !ref_map.contains_key(&name) {
                         collector.insert(Item::Interface(Interface::parse(
@@ -270,6 +289,7 @@ impl Clang {
                             &self.namespace,
                             tu,
                             ref_map,
+                            tag_rename,
                             pending_typedefs,
                         )?));
                     }
@@ -278,6 +298,7 @@ impl Clang {
                         child,
                         &self.namespace,
                         ref_map,
+                        tag_rename,
                         pending_typedefs,
                         false,
                     )?));
@@ -290,19 +311,22 @@ impl Clang {
                         child,
                         &self.namespace,
                         ref_map,
+                        tag_rename,
                         pending_typedefs,
                         true,
                     )?));
                 }
             }
             CXCursor_ClassDecl if child.is_definition() && child.has_pure_virtual_methods() => {
-                let name = child.name();
+                let tag_name = child.name();
+                let name = tag_rename.get(&tag_name).cloned().unwrap_or(tag_name);
                 if !ref_map.contains_key(&name) {
                     collector.insert(Item::Interface(Interface::parse(
                         child,
                         &self.namespace,
                         tu,
                         ref_map,
+                        tag_rename,
                         pending_typedefs,
                     )?));
                 }
@@ -329,13 +353,21 @@ impl Clang {
             CXCursor_TypedefDecl if child.is_definition() => {
                 let name = child.name();
                 if !ref_map.contains_key(&name) {
-                    if let Some(cb) =
-                        Callback::parse(child, &self.namespace, ref_map, pending_typedefs)?
-                    {
+                    if let Some(cb) = Callback::parse(
+                        child,
+                        &self.namespace,
+                        ref_map,
+                        tag_rename,
+                        pending_typedefs,
+                    )? {
                         collector.insert(Item::Callback(cb));
-                    } else if let Some(td) =
-                        Typedef::parse(child, &self.namespace, ref_map, pending_typedefs)?
-                    {
+                    } else if let Some(td) = Typedef::parse(
+                        child,
+                        &self.namespace,
+                        ref_map,
+                        tag_rename,
+                        pending_typedefs,
+                    )? {
                         collector.insert(Item::Typedef(td));
                     }
                 }
@@ -347,6 +379,7 @@ impl Clang {
                     &self.library,
                     extern_c,
                     ref_map,
+                    tag_rename,
                     pending_typedefs,
                 )?));
             }
@@ -381,5 +414,57 @@ fn enum_variant_value(repr: &str, value: i64) -> metadata::Value {
         "u64" => metadata::Value::U64(value as u64),
         "i64" => metadata::Value::I64(value),
         _ => metadata::Value::I32(value as i32),
+    }
+}
+
+/// Build a map from C struct/enum tag names to their public typedef aliases.
+///
+/// Scans all top-level `CXCursor_TypedefDecl` cursors in the translation unit
+/// (including those inside `extern "C"` / `extern "C++"` linkage-spec blocks)
+/// and records the first typedef that directly aliases each tagged struct or
+/// enum as `tag_name → typedef_name`.
+///
+/// This handles the common C idiom:
+/// ```c
+/// typedef struct _TEST { int value; } TEST, *PTEST;
+/// ```
+/// Here `_TEST` is the internal struct tag and `TEST` is the intended public
+/// name.  The map entry `"_TEST" → "TEST"` is used by the code generator to
+/// replace every occurrence of `_TEST` with `TEST` in the emitted RDL.
+fn build_tag_rename_map(tu: &TranslationUnit) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for child in tu.cursor().children() {
+        collect_typedef_renames(child, &mut map);
+    }
+    map
+}
+
+/// Inspect a single cursor for tag→typedef rename candidates and recurse
+/// into `CXCursor_LinkageSpec` blocks.
+fn collect_typedef_renames(cursor: Cursor, map: &mut HashMap<String, String>) {
+    if cursor.kind() == CXCursor_LinkageSpec {
+        for inner in cursor.children() {
+            collect_typedef_renames(inner, map);
+        }
+        return;
+    }
+    if cursor.kind() != CXCursor_TypedefDecl {
+        return;
+    }
+    let underlying = cursor.typedef_underlying_type();
+    // Unwrap a single elaborated wrapper if present.
+    let inner = if underlying.kind() == CXType_Elaborated {
+        underlying.underlying_type()
+    } else {
+        underlying
+    };
+    if inner.kind() == CXType_Record || inner.kind() == CXType_Enum {
+        let tag_name = inner.ty().name();
+        let typedef_name = cursor.name();
+        if !tag_name.is_empty() && typedef_name != tag_name {
+            // First typedef wins (for `typedef struct _T {} T, *PT;`, `T` is
+            // registered because it appears before the pointer typedef `PT`).
+            map.entry(tag_name).or_insert(typedef_name);
+        }
     }
 }
