@@ -86,6 +86,7 @@ pub fn builder() -> Bindgen {
 /// | `--sys-fn-ptrs` | Additionally generates function pointers for sys-style Rust bindings. |
 /// | `--sys-fn-extern` | Generates extern declarations rather than link macros for sys-style Rust bindings. |
 /// | `--implement` | Includes implementation traits for WinRT interfaces. |
+/// | `--noexcept` | Assumes all WinRT methods do not raise exceptions. |
 /// | `--link` | Overrides the default `windows-link` implementation for system calls. |
 ///
 ///
@@ -362,6 +363,9 @@ where
                 "--implement" => {
                     builder.implement();
                 }
+                "--noexcept" => {
+                    builder.noexcept();
+                }
                 "--specific-deps" => {
                     builder.specific_deps();
                 }
@@ -439,6 +443,7 @@ pub struct Bindgen {
     no_toml: bool,
     package: bool,
     implement: bool,
+    noexcept: bool,
     specific_deps: bool,
     sys: bool,
     typedef: bool,
@@ -589,6 +594,20 @@ impl Bindgen {
     /// Include implementation traits for WinRT interfaces.
     pub fn implement(&mut self) -> &mut Self {
         self.implement = true;
+        self
+    }
+
+    /// Assume that all WinRT methods do not raise exceptions, regardless of whether
+    /// they have the `NoExceptionAttribute`. This causes bindgen to emit infallible
+    /// signatures for HRESULT-returning WinRT methods, skipping `Result` propagation.
+    ///
+    /// Methods that genuinely carry `NoExceptionAttribute` use a `debug_assert!` to
+    /// validate the success contract, since the metadata guarantees they cannot
+    /// fail. Methods that are only assumed to be infallible because of this flag
+    /// instead use a real `assert!` so that an unexpected failure is caught even in
+    /// release builds rather than silently producing a zeroed result.
+    pub fn noexcept(&mut self) -> &mut Self {
+        self.noexcept = true;
         self
     }
 
@@ -771,6 +790,7 @@ impl Bindgen {
             sys_fn_ptrs: self.sys_fn_ptrs,
             sys_fn_extern: self.sys_fn_extern,
             implement: self.implement,
+            noexcept: self.noexcept,
             specific_deps: self.specific_deps,
             link,
             warnings: &warnings,
